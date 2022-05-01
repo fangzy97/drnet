@@ -1,0 +1,6 @@
+exp
+initmodel
+figure/
+**/__pycache__/**
+
+debug.py
