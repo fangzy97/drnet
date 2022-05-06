@@ -29,6 +29,7 @@ class Model(nn.Module):
         self.shot = args.shot
         self.train_iter = args.train_iter
         self.eval_iter = args.eval_iter
+        self.vgg = args.vgg
 
         pspnet = PSPNet(args)
         backbone_str = 'vgg' if args.vgg else 'resnet' + str(args.layers)
@@ -47,7 +48,10 @@ class Model(nn.Module):
             param.requires_grad = False;
 
         reduce_dim = 256
-        fea_dim = 1024 + 512
+        if self.vgg:
+            fea_dim = 512 + 256
+        else:
+            fea_dim = 1024 + 512 
 
         self.cls = nn.Sequential(
             nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
@@ -156,6 +160,8 @@ class Model(nn.Module):
         # Query Feature
         with torch.no_grad():
             query_feat_2, query_feat_3, query_feat_4 = self.extract_features(x)
+            if self.vgg:
+                query_feat_2 = F.interpolate(query_feat_2, size=(query_feat_3.size(2),query_feat_3.size(3)), mode='bilinear', align_corners=True)
         query_feat = torch.cat([query_feat_3, query_feat_2], 1)
         query_feat = self.down_query(query_feat)
 
@@ -175,6 +181,8 @@ class Model(nn.Module):
 
             with torch.no_grad():
                 supp_feat_2, supp_feat_3, supp_feat_4 = self.extract_features(s_x[:, i, :, :, :])
+                if self.vgg:
+                    supp_feat_2 = F.interpolate(supp_feat_2, size=(supp_feat_3.size(2),supp_feat_3.size(3)), mode='bilinear', align_corners=True)
             supp_feat = torch.cat([supp_feat_3, supp_feat_2], 1)
             supp_feat = self.down_supp(supp_feat)
 
