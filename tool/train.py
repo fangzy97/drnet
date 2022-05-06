@@ -166,6 +166,7 @@ def main_worker(gpu, ngpus_per_node, argss):
 
     max_iou = 0.
     filename = 'hcnet.pth'
+    latest_filename = 'train_epoch_0.pth'
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.fix_random_seed_val:
@@ -201,9 +202,11 @@ def main_worker(gpu, ngpus_per_node, argss):
                 logger.info('Saving checkpoint to: ' + filename)
                 torch.save({'epoch': epoch, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict()}, filename)
 
-    filename = args.save_path + '/final.pth'
-    logger.info('Saving checkpoint to: ' + filename)
-    torch.save({'epoch': args.epochs, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict()}, filename)                
+        if os.path.exists(latest_filename):
+            os.remove(latest_filename)
+        latest_filename = args.save_path + '/train_epoch_' + str(epoch) + '.pth'
+        logger.info('Saving checkpoint to: ' + latest_filename)
+        torch.save({'epoch': args.epochs, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict()}, latest_filename)                
 
 
 def train(train_loader, model, optimizer, epoch):
