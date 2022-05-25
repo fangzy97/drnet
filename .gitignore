@@ -1,0 +1,11 @@
+*.png
+*.jpg
+*.pth
+*.log
+
+.vscode/
+/dconv/
+**/*.pyc
+**/__pycache__
+snapshots/
+**/.ipynb_checkpoints
