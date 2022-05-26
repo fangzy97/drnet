@@ -94,6 +94,8 @@ def fast_hist(pred, gt, n=21):
         pred = _to_numpy(pred)
     if isinstance(gt, torch.Tensor):
         gt = _to_numpy(gt)
+    pred = pred.squeeze()
+    gt = gt.squeeze()
     k = (gt >= 0) & (gt < n)
     return np.bincount(n * pred[k].astype(np.int32) + gt[k].astype(np.int32), minlength=n**2).reshape(n, n)
 

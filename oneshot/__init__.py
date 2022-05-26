@@ -1,3 +1,3 @@
 from . import *
-__all__=["drnet"]
+__all__=["drnet", "drnet_1"]
 
