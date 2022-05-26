@@ -21,7 +21,7 @@ pip install -r requirements.txt
 
 ### Models
 
-We provide trained Models with the ResNet-50 backbone on Pascal-5<sup>i</sup> and COCO-20<sup>i</sup> for performance evalution.
+We provide trained Models with the ResNet-50 backbone on Pascal-5<sup>i</sup> and COCO-20<sup>i</sup> for performance evalution. You can download from [here](https://drive.google.com/file/d/1uB0nYj6iEUmQAstBsLusXaFSRTF2-h_w/view?usp=sharing).
 
 ### Scripts
 
