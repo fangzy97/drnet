@@ -3,8 +3,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from .lib.non_local import NonLocalBlock2D
+from .lib import resnet as models
 from .lib import vgg as vgg_models
-from torchvision.models import resnet as models
 
 
 # Masked Average Pooling
@@ -68,7 +68,8 @@ class Model(nn.Module):
             print('INFO: Using VGG_16 bn')
             vgg_models.BatchNorm = BatchNorm
             vgg16 = vgg_models.vgg16_bn(pretrained=pretrained)
-            self.layer0, self.layer1, self.layer2, self.layer3, self.layer4 = get_vgg16_layer(vgg16)
+            self.layer0, self.layer1, self.layer2, \
+                self.layer3, self.layer4 = get_vgg16_layer(vgg16)
         else:
             print('INFO: Using ResNet {}'.format(layers))
             if layers == 50:
@@ -77,7 +78,7 @@ class Model(nn.Module):
                 resnet = models.resnet101(pretrained=pretrained)
             else:
                 resnet = models.resnet152(pretrained=pretrained)
-            self.layer0 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
+            self.layer0 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu1, resnet.conv2, resnet.bn2, resnet.relu2, resnet.conv3, resnet.bn3, resnet.relu3, resnet.maxpool)
             self.layer1, self.layer2, self.layer3, self.layer4 = resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4
 
             for n, m in self.layer3.named_modules():
@@ -92,13 +93,13 @@ class Model(nn.Module):
                     m.stride = (1, 1)
 
         for param in self.parameters():
-            param.requires_grad = False
+            param.requires_grad = False;
 
         reduce_dim = 256
         if self.vgg:
             fea_dim = 512 + 256
         else:
-            fea_dim = 1024 + 512
+            fea_dim = 1024 + 512 
 
         self.cls = nn.Sequential(
             nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
@@ -108,25 +109,15 @@ class Model(nn.Module):
         )
 
         # Encoder
-        self.side3_1 = nn.Sequential(
-            nn.Conv2d(512, 256, kernel_size=1, padding=0, bias=False),  # fc6
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
-        )
-        self.side4_1 = nn.Sequential(
-            nn.Conv2d(1024 + 256, 256, kernel_size=1, padding=0, bias=False),  # fc6
-            nn.BatchNorm2d(256),
+        self.down_query = nn.Sequential(
+            nn.Conv2d(fea_dim, reduce_dim, kernel_size=1),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.5)
         )
-        self.side5_1 = nn.Sequential(
-            nn.Conv2d(2048 + 256, 256, kernel_size=1, padding=0, bias=False),  # fc6
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
-        )
-        self.down_feat = nn.Sequential(
-            nn.Conv2d(2048, 256, kernel_size=1, padding=0, bias=False),  # fc6
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
+        self.down_supp = nn.Sequential(
+            nn.Conv2d(fea_dim, reduce_dim, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.5)
         )
         # CR
         self.non_local = NonLocalBlock2D(reduce_dim)
@@ -137,13 +128,13 @@ class Model(nn.Module):
         for bin in self.pyramid_bins:
             if bin > 1:
                 self.avgpool_list.append(nn.AdaptiveAvgPool2d(bin))
-        mask_add_num = 256
+        mask_add_num = 1
         self.init_merge = nn.ModuleList()
         self.beta_conv = nn.ModuleList()
         self.inner_cls = nn.ModuleList()
         for bin in self.pyramid_bins:
             self.init_merge.append(nn.Sequential(
-                nn.Conv2d(reduce_dim * 2, reduce_dim, kernel_size=1, padding=0, bias=False),
+                nn.Conv2d(reduce_dim * 2 + mask_add_num, reduce_dim, kernel_size=1, padding=0, bias=False),
                 nn.ReLU(inplace=True),
             ))
             self.beta_conv.append(nn.Sequential(
@@ -158,7 +149,7 @@ class Model(nn.Module):
                 nn.Dropout2d(p=0.1),
                 nn.Conv2d(reduce_dim, classes, kernel_size=1)
             ))
-
+        
         self.res1 = nn.Sequential(
             nn.Conv2d(reduce_dim * len(self.pyramid_bins), reduce_dim, kernel_size=1, padding=0, bias=False),
             nn.ReLU(inplace=True),
@@ -178,8 +169,8 @@ class Model(nn.Module):
                 nn.Sequential(
                     nn.Conv2d(512, 256, kernel_size=1, stride=1, padding=0, bias=False),
                     nn.ReLU(inplace=True)
-                ))
-
+            ))
+        
     def freeze_backbone_bn(self):
         for module in self.layer0.modules():
             if isinstance(module, nn.BatchNorm2d):
@@ -197,22 +188,14 @@ class Model(nn.Module):
             if isinstance(module, nn.BatchNorm2d):
                 module.eval()
 
-    def extract_features(self, x, is_query=False):
-        with torch.no_grad():
-            x0 = self.layer0(x)
-            x1 = self.layer1(x0)
-            x2 = self.layer2(x1)
-            x3 = self.layer3(x2)
-            x4 = self.layer4(x3)
-        out = self.down_feat(x4)
+    def extract_features(self, x):
+        x = self.layer0(x)
+        x = self.layer1(x)
+        x_2 = self.layer2(x)
+        x_3 = self.layer3(x_2)
+        x_4 = self.layer4(x_3)
 
-        if is_query:
-            side_out3_1 = self.side3_1(x2)
-            side_out4_1 = self.side4_1(torch.cat((side_out3_1, x3), dim=1))
-            side_out5_1 = self.side5_1(torch.cat((side_out4_1, x4), dim=1))
-            return out, side_out5_1
-
-        return out
+        return x_2, x_3, x_4
 
     def forward(self, x, s_x, s_y, y=None):
         self.freeze_backbone_bn()
@@ -223,13 +206,17 @@ class Model(nn.Module):
         w = int((x_size[3] - 1) // 8 * self.zoom_factor + 1)
 
         # Query Feature
-        query_feat, query_feat_side = self.extract_features(x, is_query=True)
+        with torch.no_grad():
+            query_feat_2, query_feat_3, query_feat_4 = self.extract_features(x)
+            if self.vgg:
+                query_feat_2 = F.interpolate(query_feat_2, size=(query_feat_3.size(2),query_feat_3.size(3)), mode='bilinear', align_corners=True)
+        query_feat = torch.cat([query_feat_3, query_feat_2], 1)
+        query_feat = self.down_query(query_feat)
 
         sz = query_feat.shape[2]
 
         # Support Feature
         supp_feat_list = []
-        supp_feat_neg_list = []
         mask_list = []
         mask_neg_list = []
         final_supp_list = []
@@ -240,32 +227,51 @@ class Model(nn.Module):
             mask_list.append(mask)
             mask_neg_list.append(mask_neg)
 
-            supp_feat = self.extract_features(s_x[:, i, :, :, :], is_query=False)
+            with torch.no_grad():
+                supp_feat_2, supp_feat_3, supp_feat_4 = self.extract_features(s_x[:, i, :, :, :])
+                if self.vgg:
+                    supp_feat_2 = F.interpolate(supp_feat_2, size=(supp_feat_3.size(2),supp_feat_3.size(3)), mode='bilinear', align_corners=True)
+            supp_feat = torch.cat([supp_feat_3, supp_feat_2], 1)
+            supp_feat = self.down_supp(supp_feat)
 
             mask = F.interpolate(mask, size=(sz, sz), mode='bilinear', align_corners=True)
-            mask_neg = F.interpolate(mask_neg, size=(sz, sz), mode='bilinear', align_corners=True)
-
             cr_out = self.non_local(query_feat, supp_feat * mask)
             cr_list.append(cr_out)
 
             supp_feat = Weighted_GAP(supp_feat, mask)
             supp_feat_list.append(supp_feat)
 
-            supp_feat_neg = Weighted_GAP(supp_feat, mask_neg)
-            supp_feat_neg_list.append(supp_feat_neg)
+            final_supp_list.append(supp_feat_4)
 
         supp_feat = sum(supp_feat_list) / len(supp_feat_list)
-        supp_feat_neg = sum(supp_feat_neg_list) / len(supp_feat_neg_list)
         cr_out = sum(cr_list) / len(cr_list)
 
         # SR module
-        fg_init_map = torch.cosine_similarity(query_feat, supp_feat)
-        bg_init_map = torch.cosine_similarity(query_feat, supp_feat_neg)
-        init_map = torch.stack((bg_init_map, fg_init_map), dim=1) * 20
-        init_mask = init_map.argmax(dim=1, keepdim=True)
-        rec_vector = Weighted_GAP(query_feat, init_mask.float())
-        rec_map = torch.cosine_similarity(query_feat, rec_vector)
-        rec_map = self.normalization(rec_map)
+        sr_out_list = []
+        init_map_list = []
+        for i, tmp_supp_feat in enumerate(final_supp_list):
+            resize_size = tmp_supp_feat.size(2)
+            tmp_mask = F.interpolate(mask_list[i], size=(resize_size, resize_size), mode='bilinear', align_corners=True)
+            tmp_mask_neg = F.interpolate(mask_neg_list[i], size=(resize_size, resize_size), mode='bilinear', align_corners=True)
+
+            fg_vectors = Weighted_GAP(tmp_supp_feat, tmp_mask)
+            bg_vectors = Weighted_GAP(tmp_supp_feat, tmp_mask_neg)
+            fg_init_map = torch.cosine_similarity(query_feat_4, fg_vectors)
+            bg_init_map = torch.cosine_similarity(query_feat_4, bg_vectors)
+            init_map = torch.stack((bg_init_map, fg_init_map), dim=1)
+            init_map_list.append(init_map)
+
+            init_mask = init_map.argmax(dim=1, keepdim=True)
+            rec_vector = Weighted_GAP(query_feat_4, init_mask.float())
+            rec_map = torch.cosine_similarity(query_feat_4, rec_vector)
+            rec_map = self.normalization(rec_map)
+
+            rec_map = F.interpolate(rec_map, size=(sz, sz), mode='bilinear', align_corners=True)
+            sr_out_list.append(rec_map)
+        sr_out = sum(sr_out_list) / len(sr_out_list)
+        sr_out = F.interpolate(sr_out, size=(sz, sz), mode='bilinear', align_corners=True)
+
+        init_map = sum(init_map_list) / len(init_map_list)
 
         out_list = []
         pyramid_feat_list = []
@@ -273,17 +279,15 @@ class Model(nn.Module):
         for idx, tmp_bin in enumerate(self.pyramid_bins):
             if tmp_bin <= 1.0:
                 bin = int(query_feat.shape[2] * tmp_bin)
-                query_feat_bin = nn.AdaptiveAvgPool2d(bin)(query_feat_side)
+                query_feat_bin = nn.AdaptiveAvgPool2d(bin)(query_feat)
             else:
                 bin = tmp_bin
-                query_feat_bin = self.avgpool_list[idx](query_feat_side)
+                query_feat_bin = self.avgpool_list[idx](query_feat)
 
             # supp_feat_bin = supp_feat.expand(-1, -1, bin, bin)
             cr_feat_bin = F.interpolate(cr_out, size=(bin, bin), mode='bilinear', align_corners=True)
-            rec_map = F.interpolate(rec_map, size=(bin, bin), mode='bilinear', align_corners=True)
-            sr_out_bin = query_feat_bin * rec_map
-            # merge_feat_bin = torch.cat([query_feat_bin, supp_feat_bin, sr_out_bin, cr_feat_bin], 1)
-            merge_feat_bin = torch.cat([sr_out_bin, cr_feat_bin], 1)
+            sr_out_bin = F.interpolate(sr_out, size=(bin, bin), mode='bilinear', align_corners=True)
+            merge_feat_bin = torch.cat([query_feat_bin, sr_out_bin, cr_feat_bin], 1)
             merge_feat_bin = self.init_merge[idx](merge_feat_bin)
 
             if idx >= 1:
@@ -306,19 +310,20 @@ class Model(nn.Module):
         #   Output Part
         if self.zoom_factor != 1:
             out = F.interpolate(out, size=(h, w), mode='bilinear', align_corners=True)
-            init_map = F.interpolate(out, size=(h, w), mode='bilinear', align_corners=True)
-            fin_out = out + 0.4 * init_map
+            init_map = F.interpolate(init_map, size=(h, w), mode='bilinear', align_corners=True)
+        fin_out = out + 0.4 * init_map
 
         if self.training:
             main_loss = self.criterion(out, y.long())
             aux_loss = torch.zeros_like(main_loss)
-            l_init = self.criterion(init_map, y.long())
 
             for idx_k in range(len(out_list)):
                 inner_out = out_list[idx_k]
                 inner_out = F.interpolate(inner_out, size=(h, w), mode='bilinear', align_corners=True)
                 aux_loss = aux_loss + self.criterion(inner_out, y.long())
             aux_loss = aux_loss / len(out_list)
+
+            l_init = self.criterion(init_map, y.long())
 
             return fin_out.max(1)[1], main_loss, aux_loss + 0.4 * l_init
 
@@ -346,7 +351,7 @@ class Model(nn.Module):
 
     def _optimizer(self, args):
         optimizer = torch.optim.SGD(filter(lambda x: x.requires_grad, self.parameters()),
-                                    lr=args.base_lr,
-                                    momentum=args.momentum,
+                                    lr=args.base_lr, 
+                                    momentum=args.momentum, 
                                     weight_decay=args.weight_decay)
         return optimizer

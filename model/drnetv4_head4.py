@@ -77,7 +77,7 @@ class Model(nn.Module):
 
         if self.with_transformer:
             self.cr = CyCTransformer(
-                embed_dims=reduce_dim, shot=self.shot, num_points=9, num_heads=1)
+                embed_dims=reduce_dim, shot=self.shot, num_points=9, num_heads=4)
             self.supp_merge_feat = nn.Sequential(
                 nn.Conv2d(reduce_dim * 2, reduce_dim,
                           kernel_size=1, padding=0, bias=False),
@@ -214,7 +214,8 @@ class Model(nn.Module):
             supp_feat_mid = self.down_supp(supp_feat_mid)
             supp_feat_mid_list.append(supp_feat_mid)
 
-            mask = F.interpolate(mask, size=(sz[0], sz[1]), mode='bilinear', align_corners=True)
+            mask = F.interpolate(mask, size=(
+                sz[0], sz[1]), mode='bilinear', align_corners=True)
             supp_feat = Weighted_GAP(supp_feat_mid, mask)
             supp_feat_list.append(supp_feat)
 
@@ -226,8 +227,7 @@ class Model(nn.Module):
         del supp_feat_mid_list, supp_feat_list, mask, mask_neg, supp_feat_2, supp_feat_3, supp_feat_4
 
         if self.with_transformer:
-            to_merge_fts = [supp_feat_mid,
-                            supp_feat.expand(-1, -1, sz[0], sz[1])]
+            to_merge_fts = [supp_feat_mid, supp_feat.expand(-1, -1, sz[0], sz[1])]
             aug_supp_feat = torch.cat(to_merge_fts, dim=1)
             aug_supp_feat = self.supp_merge_feat(aug_supp_feat)
 
@@ -267,7 +267,8 @@ class Model(nn.Module):
                 sz[0], sz[1]), mode='bilinear', align_corners=True)
             sr_out_list.append(rec_map)
         sr_out = sum(sr_out_list) / len(sr_out_list)
-        sr_out = F.interpolate(sr_out, size=(sz[0], sz[1]), mode='bilinear', align_corners=True)
+        sr_out = F.interpolate(sr_out, size=(
+            sz[0], sz[1]), mode='bilinear', align_corners=True)
         del tmp_mask, tmp_mask_neg, fg_vectors, bg_vectors, fg_init_map, bg_init_map, init_map
         del init_mask, rec_vector, rec_map
 

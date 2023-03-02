@@ -1,11 +1,10 @@
-import random
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import cv2
+import math 
+import random
 from .positional_encoding import SinePositionalEncoding
-
 
 class FFN(nn.Module):
     """Implements feed-forward networks (FFNs) with residual connection.
@@ -25,7 +24,8 @@ class FFN(nn.Module):
                  dropout=0.0,
                  add_residual=True):
         super(FFN, self).__init__()
-        assert num_fcs >= 2, f'num_fcs should be no less than 2. got {num_fcs}.'
+        assert num_fcs >= 2, 'num_fcs should be no less ' \
+            f'than 2. got {num_fcs}.'
         self.embed_dims = embed_dims
         self.feedforward_channels = feedforward_channels
         self.num_fcs = num_fcs
@@ -132,7 +132,6 @@ class CyCTransformer(nn.Module):
                  num_levels=1,
                  num_points=9,
                  use_ffn=True,
-                 use_self=False,
                  dropout=0.1,
                  shot=1,
                  rand_fg_num=300, 
@@ -145,11 +144,11 @@ class CyCTransformer(nn.Module):
         self.num_levels             = num_levels
         self.num_points             = num_points
         self.use_ffn                = use_ffn
-        self.feedforward_channels   = embed_dims * 3
+        self.feedforward_channels   = embed_dims*3
         self.dropout                = dropout
         self.shot                   = shot
-        self.use_self               = use_self
         self.use_cross              = True
+        self.use_self               = False
         self.use_cyc                = False
         
         self.rand_fg_num = rand_fg_num * shot
@@ -163,16 +162,7 @@ class CyCTransformer(nn.Module):
         for l_id in range(self.num_layers):
             if self.use_cross:
                 self.cross_layers.append(
-                    MyCrossAttention(embed_dims, num_heads=12 if embed_dims % 12 == 0 else self.num_heads, attn_drop=self.dropout, proj_drop=self.dropout),
-                )
-                self.layer_norms.append(nn.LayerNorm(embed_dims))
-                if self.use_ffn:
-                    self.ffns.append(FFN(embed_dims, self.feedforward_channels, dropout=self.dropout))
-                    self.layer_norms.append(nn.LayerNorm(embed_dims))
-            
-            if self.use_self:
-                self.qry_self_layers.append(
-                    MyCrossAttention(embed_dims, num_heads=12 if embed_dims % 12 == 0 else self.num_heads, attn_drop=self.dropout, proj_drop=self.dropout)
+                    MyCrossAttention(embed_dims, num_heads=12 if embed_dims%12==0 else self.num_heads, attn_drop=self.dropout, proj_drop=self.dropout),
                 )
                 self.layer_norms.append(nn.LayerNorm(embed_dims))
                 if self.use_ffn:
@@ -181,13 +171,11 @@ class CyCTransformer(nn.Module):
 
         if self.use_cross: 
             self.cross_layers = nn.ModuleList(self.cross_layers)
-        if self.use_self:
-            self.qry_self_layers  = nn.ModuleList(self.qry_self_layers)
         if self.use_ffn:
             self.ffns         = nn.ModuleList(self.ffns)
         self.layer_norms  = nn.ModuleList(self.layer_norms)
 
-        self.positional_encoding = SinePositionalEncoding(embed_dims // 2, normalize=True) 
+        self.positional_encoding = SinePositionalEncoding(embed_dims//2, normalize=True) 
         self.level_embed = nn.Parameter(torch.rand(num_levels, embed_dims))
         nn.init.xavier_uniform_(self.level_embed)
 
@@ -201,6 +189,20 @@ class CyCTransformer(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
             if hasattr(m, 'bias') and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
+
+    def get_reference_points(self, spatial_shapes, device):
+        reference_points_list = []
+        for lvl, (H_, W_) in enumerate(spatial_shapes):
+
+            ref_y, ref_x = torch.meshgrid(torch.linspace(0.5, H_ - 0.5, H_, dtype=torch.float32, device=device),
+                                          torch.linspace(0.5, W_ - 0.5, W_, dtype=torch.float32, device=device))
+            ref_y = ref_y.reshape(-1)[None] / H_
+            ref_x = ref_x.reshape(-1)[None] / W_
+            ref = torch.stack((ref_x, ref_y), -1)
+            reference_points_list.append(ref)
+        reference_points = torch.cat(reference_points_list, 1)
+        reference_points = reference_points.unsqueeze(2).repeat(1, 1, len(spatial_shapes), 1)
+        return reference_points
 
     def get_qry_flatten_input(self, x, qry_masks):
         src_flatten = [] 
@@ -258,10 +260,10 @@ class CyCTransformer(nn.Module):
             supp_valid_mask_s = []
             supp_obj_mask_s = []
             for img_id in range(s_x.size(0)):
-                supp_valid_mask_s.append(s_padding_mask[img_id, st_id, ...] == 255)
+                supp_valid_mask_s.append(s_padding_mask[img_id, st_id, ...]==255)
                 obj_mask = supp_mask[img_id, st_id, ...]==1
                 if obj_mask.sum() == 0: # To avoid NaN
-                    obj_mask[obj_mask.size(0) // 2 - 1 : obj_mask.size(0) // 2 + 1, obj_mask.size(1) // 2 - 1 : obj_mask.size(1) // 2 + 1] = True
+                    obj_mask[obj_mask.size(0)//2-1:obj_mask.size(0)//2+1, obj_mask.size(1)//2-1:obj_mask.size(1)//2+1] = True
                 if (obj_mask==False).sum() == 0: # To avoid NaN
                     obj_mask[0, 0]   = False
                     obj_mask[-1, -1] = False 
@@ -291,8 +293,8 @@ class CyCTransformer(nn.Module):
             scale_min = 0.6
             scale_max = 4.0 if self.shot==1 else 1.4
             sampling_scale = random.uniform(scale_min, scale_max)
-            rand_fg_num = int(self.rand_fg_num * sampling_scale)
-            rand_bg_num = int(self.rand_bg_num * sampling_scale)
+            rand_fg_num = int(self.rand_fg_num*sampling_scale)
+            rand_bg_num = int(self.rand_bg_num*sampling_scale)
         else:
             rand_fg_num = self.rand_fg_num
             rand_bg_num = self.rand_bg_num
@@ -304,23 +306,23 @@ class CyCTransformer(nn.Module):
             k_b = s_x[b_id] # [num_elem, c]
             supp_mask_b = supp_mask[b_id] # [num_elem]
             num_fg = supp_mask_b.sum()
-            num_bg = (supp_mask_b == False).sum()
+            num_bg = (supp_mask_b==False).sum()
             fg_k = k_b[supp_mask_b] # [num_fg, c]
-            bg_k = k_b[supp_mask_b == False] # [num_bg, c]
+            bg_k = k_b[supp_mask_b==False] # [num_bg, c]
 
-            if num_fg < rand_fg_num:
-                rest_num = rand_fg_num + rand_bg_num - num_fg
+            if num_fg<rand_fg_num:
+                rest_num = rand_fg_num+rand_bg_num-num_fg
                 bg_select_idx = torch.randperm(num_bg)[:rest_num]                
                 re_k = torch.cat([fg_k, bg_k[bg_select_idx]], dim=0)
-                re_mask = torch.cat([supp_mask_b[supp_mask_b == True], supp_mask_b[bg_select_idx]], dim=0)
-                re_valid_mask = torch.cat([supp_valid_mask[b_id][supp_mask_b == True], supp_valid_mask[b_id][bg_select_idx]], dim=0)
+                re_mask = torch.cat([supp_mask_b[supp_mask_b==True], supp_mask_b[bg_select_idx]], dim=0)
+                re_valid_mask = torch.cat([supp_valid_mask[b_id][supp_mask_b==True], supp_valid_mask[b_id][bg_select_idx]], dim=0)
 
-            elif num_bg < rand_bg_num:
-                rest_num = rand_fg_num + rand_bg_num - num_bg
+            elif num_bg<rand_bg_num:
+                rest_num = rand_fg_num+rand_bg_num-num_bg
                 fg_select_idx = torch.randperm(num_fg)[:rest_num]
                 re_k = torch.cat([fg_k[fg_select_idx], bg_k], dim=0)
-                re_mask = torch.cat([supp_mask_b[fg_select_idx], supp_mask_b[supp_mask_b == False]], dim=0)
-                re_valid_mask = torch.cat([supp_valid_mask[b_id][fg_select_idx], supp_valid_mask[b_id][supp_mask_b == False]], dim=0)
+                re_mask = torch.cat([supp_mask_b[fg_select_idx], supp_mask_b[supp_mask_b==False]], dim=0)
+                re_valid_mask = torch.cat([supp_valid_mask[b_id][fg_select_idx], supp_valid_mask[b_id][supp_mask_b==False]], dim=0)
                 
             else:
                 fg_select_idx = torch.randperm(num_fg)[:rand_fg_num]
@@ -330,7 +332,7 @@ class CyCTransformer(nn.Module):
                 re_valid_mask = torch.cat([supp_valid_mask[b_id][fg_select_idx], supp_valid_mask[b_id][bg_select_idx]], dim=0)
             
             re_arrange_k.append(re_k)
-            re_arrange_mask.append(re_mask)
+            re_arrange_mask.append(re_mask) 
             re_arrange_valid_mask.append(re_valid_mask)
 
         k = torch.stack(re_arrange_k, dim=0)
@@ -349,25 +351,15 @@ class CyCTransformer(nn.Module):
         bs, c = x[0].size()[:2]
 
         x_flatten, qry_valid_masks_flatten, pos_embed_flatten, spatial_shapes, level_start_index = self.get_qry_flatten_input(x, qry_masks)
+
         s_x, supp_valid_mask, supp_mask_flatten = self.get_supp_flatten_input(s_x, supp_mask.clone(), s_padding_mask.clone())
 
-        q = x_flatten
         pos = pos_embed_flatten
+        q = x_flatten + pos
         
         ln_id = 0
         ffn_id = 0
         for l_id in range(self.num_layers):
-            if self.use_self:
-                q = q + self.proj_drop(self.qry_self_layers[l_id](q + pos, q, q, qry_valid_masks_flatten, None, False))
-                q = self.layer_norms[ln_id](q)
-                ln_id += 1
-
-                if self.use_ffn:
-                    q = self.ffns[ffn_id](q)
-                    ffn_id += 1
-                    q = self.layer_norms[ln_id](q)
-                    ln_id += 1
-
             if self.use_cross:
                 k, sampled_mask, sampled_valid_mask = self.sparse_sampling(s_x, supp_mask_flatten, supp_valid_mask) if self.training or l_id==0 else (k, sampled_mask, sampled_valid_mask)
                 v = k.clone()
@@ -391,5 +383,4 @@ class CyCTransformer(nn.Module):
             qry_feat_decouple.append(qry_feat[:, :, start_idx:start_idx+h*w].view(bs, c, h, w))
 
         return qry_feat_decouple
-
 

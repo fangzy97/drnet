@@ -3,9 +3,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .lib.non_local import NonLocalBlock2D
 from .lib.transformer.cyc_transformer import CyCTransformer
 from .pspnet import Model as PSPNet
+from .lib.ASPP import ASPP
 
 
 # Masked Average Pooling
@@ -36,10 +36,8 @@ class Model(nn.Module):
 
         pspnet = PSPNet(args)
         backbone_str = 'vgg' if args.vgg else 'resnet' + str(args.layers)
-        weight_path = 'initmodel/PSPNet/{}/split{}/{}/best.pth'.format(
-            args.data_set, args.split, backbone_str)
-        new_param = torch.load(weight_path, map_location=torch.device('cpu'))[
-            'state_dict']
+        weight_path = 'initmodel/PSPNet/{}/split{}/{}/best.pth'.format(args.data_set, args.split, backbone_str)
+        new_param = torch.load(weight_path, map_location=torch.device('cpu'))['state_dict']
         try:
             pspnet.load_state_dict(new_param)
         except RuntimeError:                   # 1GPU loads mGPU model
@@ -56,8 +54,7 @@ class Model(nn.Module):
         fea_dim = 1024 + 512
 
         self.cls = nn.Sequential(
-            nn.Conv2d(reduce_dim, reduce_dim,
-                      kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
             nn.ReLU(inplace=True),
             nn.Dropout2d(p=0.1),
             nn.Conv2d(reduce_dim, classes, kernel_size=1)
@@ -74,10 +71,12 @@ class Model(nn.Module):
             nn.ReLU(inplace=True),
             nn.Dropout2d(p=0.5)
         )
-
+        mask_add_num = 1
+        self.init_merge = nn.Sequential(
+            nn.Conv2d(reduce_dim * 2 + mask_add_num, reduce_dim, kernel_size=1, padding=0, bias=False)
+        )
         if self.with_transformer:
-            self.cr = CyCTransformer(
-                embed_dims=reduce_dim, shot=self.shot, num_points=9, num_heads=1)
+            self.cr = CyCTransformer(embed_dims=reduce_dim, shot=self.shot, num_points=9, num_heads=1, use_self=True)
             self.supp_merge_feat = nn.Sequential(
                 nn.Conv2d(reduce_dim * 2, reduce_dim,
                           kernel_size=1, padding=0, bias=False),
@@ -96,63 +95,31 @@ class Model(nn.Module):
                           kernel_size=3, padding=1, bias=False),
                 nn.ReLU(inplace=True),
             )
-
-        self.pyramid_bins = args.ppm_scales
-
-        self.avgpool_list = nn.ModuleList()
-        for bin in self.pyramid_bins:
-            if bin > 1:
-                self.avgpool_list.append(nn.AdaptiveAvgPool2d(bin))
-        mask_add_num = 256 + 1
-        self.init_merge = nn.ModuleList()
-        self.beta_conv = nn.ModuleList()
-        self.inner_cls = nn.ModuleList()
-        for bin in self.pyramid_bins:
-            self.init_merge.append(nn.Sequential(
-                nn.Conv2d(reduce_dim * 2 + mask_add_num, reduce_dim,
-                          kernel_size=1, padding=0, bias=False),
-                nn.ReLU(inplace=True),
-            ))
-            self.beta_conv.append(nn.Sequential(
-                nn.Conv2d(reduce_dim, reduce_dim,
-                          kernel_size=3, padding=1, bias=False),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(reduce_dim, reduce_dim,
-                          kernel_size=3, padding=1, bias=False),
-                nn.ReLU(inplace=True)
-            ))
-            self.inner_cls.append(nn.Sequential(
-                nn.Conv2d(reduce_dim, reduce_dim,
-                          kernel_size=3, padding=1, bias=False),
-                nn.ReLU(inplace=True),
-                nn.Dropout2d(p=0.1),
-                nn.Conv2d(reduce_dim, classes, kernel_size=1)
-            ))
-
+        else:
+            self.merge_res = nn.Sequential(
+                    nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
+                    nn.ReLU(inplace=True),
+                )
+        self.ASPP = ASPP(reduce_dim)
         self.res1 = nn.Sequential(
-            nn.Conv2d(reduce_dim * len(self.pyramid_bins),
-                      reduce_dim, kernel_size=1, padding=0, bias=False),
-            nn.ReLU(inplace=True),
-        )
+            nn.Conv2d(reduce_dim*5, reduce_dim, kernel_size=1, padding=0, bias=False),
+            nn.ReLU(inplace=True))
         self.res2 = nn.Sequential(
-            nn.Conv2d(reduce_dim, reduce_dim,
-                      kernel_size=3, padding=1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(reduce_dim, reduce_dim,
-                      kernel_size=3, padding=1, bias=False),
-            nn.ReLU(inplace=True),
-        )
+            nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
+            nn.ReLU(inplace=True),   
+            nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
+            nn.ReLU(inplace=True))
 
-        self.GAP = nn.AdaptiveAvgPool2d(1)
+        self.init_weights()
 
-        self.alpha_conv = nn.ModuleList()
-        for _ in range(len(self.pyramid_bins) - 1):
-            self.alpha_conv.append(
-                nn.Sequential(
-                    nn.Conv2d(512, 256, kernel_size=1,
-                              stride=1, padding=0, bias=False),
-                    nn.ReLU(inplace=True)
-                ))
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if hasattr(m, 'bias') and m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
     def freeze_backbone_bn(self):
         for module in self.layer0.modules():
@@ -214,35 +181,12 @@ class Model(nn.Module):
             supp_feat_mid = self.down_supp(supp_feat_mid)
             supp_feat_mid_list.append(supp_feat_mid)
 
-            mask = F.interpolate(mask, size=(sz[0], sz[1]), mode='bilinear', align_corners=True)
+            mask = F.interpolate(mask, size=(
+                sz[0], sz[1]), mode='bilinear', align_corners=True)
             supp_feat = Weighted_GAP(supp_feat_mid, mask)
             supp_feat_list.append(supp_feat)
 
             final_supp_list.append(supp_feat_4)
-
-        # [bs x shot] x c x h x w
-        supp_feat_mid = torch.cat(supp_feat_mid_list, dim=0)
-        supp_feat = sum(supp_feat_list) / len(supp_feat_list)
-        del supp_feat_mid_list, supp_feat_list, mask, mask_neg, supp_feat_2, supp_feat_3, supp_feat_4
-
-        if self.with_transformer:
-            to_merge_fts = [supp_feat_mid,
-                            supp_feat.expand(-1, -1, sz[0], sz[1])]
-            aug_supp_feat = torch.cat(to_merge_fts, dim=1)
-            aug_supp_feat = self.supp_merge_feat(aug_supp_feat)
-
-            cr_list = self.cr(query_feat, padding_mask.float(), aug_supp_feat, s_y.clone().float(), s_padding_mask.float())
-            fused_cr = []
-            for lvl, cr in enumerate(cr_list):
-                if lvl == 0:
-                    fused_cr.append(cr)
-                else:
-                    fused_cr.append(F.interpolate(
-                        cr, size=(sz[0], sz[1]), mode='bilinear', align_corners=True))
-            fused_cr = torch.cat(fused_cr, dim=1)
-            fused_cr = self.merge_multi_lvl_reduce(fused_cr)
-            fused_cr = self.merge_multi_lvl_sum(fused_cr) + fused_cr
-            del cr_list, to_merge_fts, aug_supp_feat
 
         # SR module
         sr_out_list = []
@@ -263,61 +207,51 @@ class Model(nn.Module):
             rec_map = torch.cosine_similarity(query_feat_4, rec_vector)
             rec_map = self.normalization(rec_map)
 
-            rec_map = F.interpolate(rec_map, size=(
-                sz[0], sz[1]), mode='bilinear', align_corners=True)
+            rec_map = F.interpolate(rec_map, size=(sz[0], sz[1]), mode='bilinear', align_corners=True)
             sr_out_list.append(rec_map)
         sr_out = sum(sr_out_list) / len(sr_out_list)
         sr_out = F.interpolate(sr_out, size=(sz[0], sz[1]), mode='bilinear', align_corners=True)
         del tmp_mask, tmp_mask_neg, fg_vectors, bg_vectors, fg_init_map, bg_init_map, init_map
         del init_mask, rec_vector, rec_map
 
-        out_list = []
-        pyramid_feat_list = []
+        # [bs x shot] x c x h x w
+        supp_feat_mid = torch.cat(supp_feat_mid_list, dim=0)
+        supp_feat = sum(supp_feat_list) / len(supp_feat_list)
+        del supp_feat_mid_list, supp_feat_list, mask, mask_neg, supp_feat_2, supp_feat_3, supp_feat_4
 
-        for idx, tmp_bin in enumerate(self.pyramid_bins):
-            if tmp_bin <= 1.0:
-                bin = int(query_feat.shape[2] * tmp_bin)
-                query_feat_bin = nn.AdaptiveAvgPool2d(bin)(query_feat)
-            else:
-                bin = tmp_bin
-                query_feat_bin = self.avgpool_list[idx](query_feat)
+        query_feat_cat = torch.cat([query_feat, supp_feat.expand_as(query_feat), sr_out], dim=1)
+        query_feat = self.init_merge(query_feat_cat)
 
-            supp_feat_bin = supp_feat.expand(-1, -1, bin, bin)
-            cr_feat_bin = F.interpolate(fused_cr, size=(bin, bin), mode='bilinear', align_corners=True)
-            sr_out_bin = F.interpolate(sr_out, size=(bin, bin), mode='bilinear', align_corners=True)
-            merge_feat_bin = torch.cat([query_feat_bin, supp_feat_bin, sr_out_bin, cr_feat_bin], 1)
-            merge_feat_bin = self.init_merge[idx](merge_feat_bin)
+        if self.with_transformer:
+            to_merge_fts = [supp_feat_mid, supp_feat.expand(-1, -1, sz[0], sz[1])]
+            aug_supp_feat = torch.cat(to_merge_fts, dim=1)
+            aug_supp_feat = self.supp_merge_feat(aug_supp_feat)
 
-            if idx >= 1:
-                pre_feat_bin = pyramid_feat_list[idx - 1].clone()
-                pre_feat_bin = F.interpolate(pre_feat_bin, size=(bin, bin), mode='bilinear', align_corners=True)
-                rec_feat_bin = torch.cat([merge_feat_bin, pre_feat_bin], 1)
-                merge_feat_bin = self.alpha_conv[idx - 1](rec_feat_bin) + merge_feat_bin
+            query_feat_list = self.cr(query_feat, padding_mask.float(), aug_supp_feat, s_y.clone().float(), s_padding_mask.float())
+            fused_query_feat = []
+            for lvl, cr in enumerate(query_feat_list):
+                if lvl == 0:
+                    fused_query_feat.append(cr)
+                else:
+                    fused_query_feat.append(F.interpolate(cr, size=(sz[0], sz[1]), mode='bilinear', align_corners=True))
+            fused_query_feat = torch.cat(fused_query_feat, dim=1)
+            fused_query_feat = self.merge_multi_lvl_reduce(fused_query_feat)
+            fused_query_feat = self.merge_multi_lvl_sum(fused_query_feat) + fused_query_feat
+            del to_merge_fts, aug_supp_feat
+        else:
+            query_feat = self.merge_res(query_feat) + query_feat
+            query_feat_list = [query_feat]
+            fused_query_feat = query_feat.clone()
 
-            merge_feat_bin = self.beta_conv[idx](merge_feat_bin) + merge_feat_bin
-            inner_out_bin = self.inner_cls[idx](merge_feat_bin)
-            merge_feat_bin = F.interpolate(merge_feat_bin, size=(query_feat.size(2), query_feat.size(3)), mode='bilinear', align_corners=True)
-            pyramid_feat_list.append(merge_feat_bin)
-            out_list.append(inner_out_bin)
-
-        query_feat = torch.cat(pyramid_feat_list, 1)
+        query_feat = self.ASPP(fused_query_feat)
         query_feat = self.res1(query_feat)
         query_feat = self.res2(query_feat) + query_feat
         out = self.cls(query_feat)
-
-        #   Output Part
-        if self.zoom_factor != 1:
-            out = F.interpolate(out, size=(h, w), mode='bilinear', align_corners=True)
+        out = F.interpolate(out, size=(h, w), mode='bilinear', align_corners=True)
 
         if self.training:
-            main_loss = self.criterion(out, y.long())
+            main_loss = self.criterion(out, y.long())         
             aux_loss = torch.zeros_like(main_loss)
-
-            for idx_k in range(len(out_list)):
-                inner_out = out_list[idx_k]
-                inner_out = F.interpolate(inner_out, size=(h, w), mode='bilinear', align_corners=True)
-                aux_loss = aux_loss + self.criterion(inner_out, y.long())
-            aux_loss = aux_loss / len(out_list)
 
             return out.max(1)[1], main_loss, aux_loss
 

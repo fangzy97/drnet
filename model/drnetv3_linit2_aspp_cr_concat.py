@@ -4,6 +4,7 @@ from torch import nn
 
 from .lib.non_local import NonLocalBlock2D
 from .pspnet import Model as PSPNet
+from .lib.ASPP import ASPP
 
 
 # Masked Average Pooling
@@ -53,13 +54,6 @@ class Model(nn.Module):
         else:
             fea_dim = 1024 + 512 
 
-        self.cls = nn.Sequential(
-            nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(p=0.1),
-            nn.Conv2d(reduce_dim, classes, kernel_size=1)
-        )
-
         # Encoder
         self.down_query = nn.Sequential(
             nn.Conv2d(fea_dim, reduce_dim, kernel_size=1),
@@ -71,57 +65,27 @@ class Model(nn.Module):
             nn.ReLU(inplace=True),
             nn.Dropout2d(p=0.5)
         )
-        # SR
-        self.non_local = NonLocalBlock2D(reduce_dim)
+        # CR
+        self.non_local = NonLocalBlock2D(reduce_dim, concat=True)
 
-        self.pyramid_bins = args.ppm_scales
-
-        self.avgpool_list = nn.ModuleList()
-        for bin in self.pyramid_bins:
-            if bin > 1:
-                self.avgpool_list.append(nn.AdaptiveAvgPool2d(bin))
-        mask_add_num = 256 + 1
-        self.init_merge = nn.ModuleList()
-        self.beta_conv = nn.ModuleList()
-        self.inner_cls = nn.ModuleList()
-        for bin in self.pyramid_bins:
-            self.init_merge.append(nn.Sequential(
-                nn.Conv2d(reduce_dim * 2 + mask_add_num, reduce_dim, kernel_size=1, padding=0, bias=False),
-                nn.ReLU(inplace=True),
-            ))
-            self.beta_conv.append(nn.Sequential(
-                nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
-                nn.ReLU(inplace=True)
-            ))
-            self.inner_cls.append(nn.Sequential(
-                nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
-                nn.ReLU(inplace=True),
-                nn.Dropout2d(p=0.1),
-                nn.Conv2d(reduce_dim, classes, kernel_size=1)
-            ))
-        
+        mask_add_num = 0
+        self.init_merge = nn.Sequential(
+            nn.Conv2d(reduce_dim * 2 + mask_add_num, reduce_dim, kernel_size=1, padding=0, bias=False),
+            nn.ReLU(inplace=True))
+        self.ASPP = ASPP(reduce_dim)
         self.res1 = nn.Sequential(
-            nn.Conv2d(reduce_dim * len(self.pyramid_bins), reduce_dim, kernel_size=1, padding=0, bias=False),
-            nn.ReLU(inplace=True),
-        )
+            nn.Conv2d(reduce_dim*5, reduce_dim, kernel_size=1, padding=0, bias=False),
+            nn.ReLU(inplace=True))
         self.res2 = nn.Sequential(
             nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=True),   
+            nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
+            nn.ReLU(inplace=True))
+        self.cls = nn.Sequential(
             nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
             nn.ReLU(inplace=True),
-        )
-
-        self.GAP = nn.AdaptiveAvgPool2d(1)
-
-        self.alpha_conv = nn.ModuleList()
-        for _ in range(len(self.pyramid_bins) - 1):
-            self.alpha_conv.append(
-                nn.Sequential(
-                    nn.Conv2d(512, 256, kernel_size=1, stride=1, padding=0, bias=False),
-                    nn.ReLU(inplace=True)
-            ))
+            nn.Dropout2d(p=0.1),
+            nn.Conv2d(reduce_dim, args.classes, kernel_size=1))
         
     def freeze_backbone_bn(self):
         for module in self.layer0.modules():
@@ -199,7 +163,7 @@ class Model(nn.Module):
         cr_out = sum(cr_list) / len(cr_list)
 
         # SR module
-        sr_out_list = []
+        init_map_list = []
         for i, tmp_supp_feat in enumerate(final_supp_list):
             resize_size = tmp_supp_feat.size(2)
             tmp_mask = F.interpolate(mask_list[i], size=(resize_size, resize_size), mode='bilinear', align_corners=True)
@@ -210,46 +174,14 @@ class Model(nn.Module):
             fg_init_map = torch.cosine_similarity(query_feat_4, fg_vectors)
             bg_init_map = torch.cosine_similarity(query_feat_4, bg_vectors)
             init_map = torch.stack((bg_init_map, fg_init_map), dim=1)
-            init_mask = init_map.argmax(dim=1, keepdim=True)
-            rec_vector = Weighted_GAP(query_feat_4, init_mask.float())
-            rec_map = torch.cosine_similarity(query_feat_4, rec_vector)
-            rec_map = self.normalization(rec_map)
+            init_map_list.append(init_map)
 
-            rec_map = F.interpolate(rec_map, size=(sz, sz), mode='bilinear', align_corners=True)
-            sr_out_list.append(rec_map)
-        sr_out = sum(sr_out_list) / len(sr_out_list)
-        sr_out = F.interpolate(sr_out, size=(sz, sz), mode='bilinear', align_corners=True)
+        init_map = sum(init_map_list) / len(init_map_list)
 
-        out_list = []
-        pyramid_feat_list = []
+        merge_feat = torch.cat([cr_out, query_feat], 1)   # 256 + 256 + 1
+        merge_feat = self.init_merge(merge_feat)
 
-        for idx, tmp_bin in enumerate(self.pyramid_bins):
-            if tmp_bin <= 1.0:
-                bin = int(query_feat.shape[2] * tmp_bin)
-                query_feat_bin = nn.AdaptiveAvgPool2d(bin)(query_feat)
-            else:
-                bin = tmp_bin
-                query_feat_bin = self.avgpool_list[idx](query_feat)
-
-            supp_feat_bin = supp_feat.expand(-1, -1, bin, bin)
-            cr_feat_bin = F.interpolate(cr_out, size=(bin, bin), mode='bilinear', align_corners=True)
-            sr_out_bin = F.interpolate(sr_out, size=(bin, bin), mode='bilinear', align_corners=True)
-            merge_feat_bin = torch.cat([query_feat_bin, supp_feat_bin, sr_out_bin, cr_feat_bin], 1)
-            merge_feat_bin = self.init_merge[idx](merge_feat_bin)
-
-            if idx >= 1:
-                pre_feat_bin = pyramid_feat_list[idx - 1].clone()
-                pre_feat_bin = F.interpolate(pre_feat_bin, size=(bin, bin), mode='bilinear', align_corners=True)
-                rec_feat_bin = torch.cat([merge_feat_bin, pre_feat_bin], 1)
-                merge_feat_bin = self.alpha_conv[idx - 1](rec_feat_bin) + merge_feat_bin
-
-            merge_feat_bin = self.beta_conv[idx](merge_feat_bin) + merge_feat_bin
-            inner_out_bin = self.inner_cls[idx](merge_feat_bin)
-            merge_feat_bin = F.interpolate(merge_feat_bin, size=(query_feat.size(2), query_feat.size(3)), mode='bilinear', align_corners=True)
-            pyramid_feat_list.append(merge_feat_bin)
-            out_list.append(inner_out_bin)
-
-        query_feat = torch.cat(pyramid_feat_list, 1)
+        query_feat = self.ASPP(merge_feat)
         query_feat = self.res1(query_feat)
         query_feat = self.res2(query_feat) + query_feat
         out = self.cls(query_feat)
@@ -257,20 +189,18 @@ class Model(nn.Module):
         #   Output Part
         if self.zoom_factor != 1:
             out = F.interpolate(out, size=(h, w), mode='bilinear', align_corners=True)
+            init_map = F.interpolate(init_map, size=(h, w), mode='bilinear', align_corners=True)
+        
+        fin_out = out + 0.4 * init_map
 
         if self.training:
             main_loss = self.criterion(out, y.long())
-            aux_loss = torch.zeros_like(main_loss)
+            l_init = self.criterion(init_map, y.long())
 
-            for idx_k in range(len(out_list)):
-                inner_out = out_list[idx_k]
-                inner_out = F.interpolate(inner_out, size=(h, w), mode='bilinear', align_corners=True)
-                aux_loss = aux_loss + self.criterion(inner_out, y.long())
-            aux_loss = aux_loss / len(out_list)
+            return fin_out.max(1)[1], main_loss, 0.4 * l_init
 
-            return out.max(1)[1], main_loss, aux_loss
-
-        return out
+        # sr_out = F.interpolate(sr_out, size=(h, w), mode='bilinear', align_corners=True)
+        return fin_out
 
     def normalization(self, x):
         b, h, w = x.shape

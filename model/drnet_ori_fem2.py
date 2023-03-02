@@ -3,8 +3,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .lib.non_local import NonLocalBlock2D
-from .lib import vgg as vgg_models
-from torchvision.models import resnet as models
+from .pspnet import Model as PSPNet
 
 
 # Masked Average Pooling
@@ -14,35 +13,6 @@ def Weighted_GAP(supp_feat, mask):
     area = F.avg_pool2d(mask, (supp_feat.size()[2], supp_feat.size()[3])) * feat_h * feat_w + 0.0005
     supp_feat = F.avg_pool2d(input=supp_feat, kernel_size=supp_feat.shape[-2:]) * feat_h * feat_w / area
     return supp_feat
-
-
-def get_vgg16_layer(model):
-    layer0_idx = range(0,7)
-    layer1_idx = range(7,14)
-    layer2_idx = range(14,24)
-    layer3_idx = range(24,34)
-    layer4_idx = range(34,43)
-    layers_0 = []
-    layers_1 = []
-    layers_2 = []
-    layers_3 = []
-    layers_4 = []
-    for idx in layer0_idx:
-        layers_0 += [model.features[idx]]
-    for idx in layer1_idx:
-        layers_1 += [model.features[idx]]
-    for idx in layer2_idx:
-        layers_2 += [model.features[idx]]
-    for idx in layer3_idx:
-        layers_3 += [model.features[idx]]
-    for idx in layer4_idx:
-        layers_4 += [model.features[idx]]  
-    layer0 = nn.Sequential(*layers_0) 
-    layer1 = nn.Sequential(*layers_1) 
-    layer2 = nn.Sequential(*layers_2) 
-    layer3 = nn.Sequential(*layers_3) 
-    layer4 = nn.Sequential(*layers_4)
-    return layer0,layer1,layer2,layer3,layer4
 
 
 class Model(nn.Module):
@@ -61,44 +31,27 @@ class Model(nn.Module):
         self.eval_iter = args.eval_iter
         self.vgg = args.vgg
 
-        BatchNorm = nn.BatchNorm2d
-        pretrained = True
+        pspnet = PSPNet(args)
+        backbone_str = 'vgg' if args.vgg else 'resnet' + str(args.layers)
+        weight_path = 'initmodel/PSPNet/{}/split{}/{}/best.pth'.format(args.data_set, args.split, backbone_str)
+        new_param = torch.load(weight_path, map_location=torch.device('cpu'))['state_dict']
+        try: 
+            pspnet.load_state_dict(new_param)
+        except RuntimeError:                   # 1GPU loads mGPU model
+            for key in list(new_param.keys()):
+                new_param[key[7:]] = new_param.pop(key)
+            pspnet.load_state_dict(new_param)
 
-        if self.vgg:
-            print('INFO: Using VGG_16 bn')
-            vgg_models.BatchNorm = BatchNorm
-            vgg16 = vgg_models.vgg16_bn(pretrained=pretrained)
-            self.layer0, self.layer1, self.layer2, self.layer3, self.layer4 = get_vgg16_layer(vgg16)
-        else:
-            print('INFO: Using ResNet {}'.format(layers))
-            if layers == 50:
-                resnet = models.resnet50(pretrained=pretrained)
-            elif layers == 101:
-                resnet = models.resnet101(pretrained=pretrained)
-            else:
-                resnet = models.resnet152(pretrained=pretrained)
-            self.layer0 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
-            self.layer1, self.layer2, self.layer3, self.layer4 = resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4
-
-            for n, m in self.layer3.named_modules():
-                if 'conv2' in n:
-                    m.dilation, m.padding, m.stride = (2, 2), (2, 2), (1, 1)
-                elif 'downsample.0' in n:
-                    m.stride = (1, 1)
-            for n, m in self.layer4.named_modules():
-                if 'conv2' in n:
-                    m.dilation, m.padding, m.stride = (4, 4), (4, 4), (1, 1)
-                elif 'downsample.0' in n:
-                    m.stride = (1, 1)
+        self.layer0, self.layer1, self.layer2, self.layer3, self.layer4 = pspnet.layer0, pspnet.layer1, pspnet.layer2, pspnet.layer3, pspnet.layer4
 
         for param in self.parameters():
-            param.requires_grad = False
+            param.requires_grad = False;
 
         reduce_dim = 256
         if self.vgg:
             fea_dim = 512 + 256
         else:
-            fea_dim = 1024 + 512
+            fea_dim = 1024 + 512 
 
         self.cls = nn.Sequential(
             nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
@@ -109,26 +62,26 @@ class Model(nn.Module):
 
         # Encoder
         self.side3_1 = nn.Sequential(
-            nn.Conv2d(512, 256, kernel_size=1, padding=0, bias=False),  # fc6
+            nn.Conv2d(512, 256, kernel_size=3, dilation=1,  padding=1, bias=False),   #fc6
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True)
         )
         self.side4_1 = nn.Sequential(
-            nn.Conv2d(1024 + 256, 256, kernel_size=1, padding=0, bias=False),  # fc6
+            nn.Conv2d(1024 + 256, 256, kernel_size=3, dilation=1,  padding=1, bias=False),   #fc6
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
         )
         self.side5_1 = nn.Sequential(
-            nn.Conv2d(2048 + 256, 256, kernel_size=1, padding=0, bias=False),  # fc6
+            nn.Conv2d(2048 + 256, 256, kernel_size=3, dilation=1,  padding=1, bias=False),   #fc6
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True)
         )
         self.down_feat = nn.Sequential(
-            nn.Conv2d(2048, 256, kernel_size=1, padding=0, bias=False),  # fc6
+            nn.Conv2d(2048, 256, kernel_size=3, padding=1, bias=False),  # fc6
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True)
         )
-        # CR
+        # SR
         self.non_local = NonLocalBlock2D(reduce_dim)
 
         self.pyramid_bins = args.ppm_scales
@@ -158,7 +111,7 @@ class Model(nn.Module):
                 nn.Dropout2d(p=0.1),
                 nn.Conv2d(reduce_dim, classes, kernel_size=1)
             ))
-
+        
         self.res1 = nn.Sequential(
             nn.Conv2d(reduce_dim * len(self.pyramid_bins), reduce_dim, kernel_size=1, padding=0, bias=False),
             nn.ReLU(inplace=True),
@@ -178,8 +131,8 @@ class Model(nn.Module):
                 nn.Sequential(
                     nn.Conv2d(512, 256, kernel_size=1, stride=1, padding=0, bias=False),
                     nn.ReLU(inplace=True)
-                ))
-
+            ))
+        
     def freeze_backbone_bn(self):
         for module in self.layer0.modules():
             if isinstance(module, nn.BatchNorm2d):
@@ -266,6 +219,7 @@ class Model(nn.Module):
         rec_vector = Weighted_GAP(query_feat, init_mask.float())
         rec_map = torch.cosine_similarity(query_feat, rec_vector)
         rec_map = self.normalization(rec_map)
+        sr_out = query_feat_side * rec_map
 
         out_list = []
         pyramid_feat_list = []
@@ -280,10 +234,9 @@ class Model(nn.Module):
 
             # supp_feat_bin = supp_feat.expand(-1, -1, bin, bin)
             cr_feat_bin = F.interpolate(cr_out, size=(bin, bin), mode='bilinear', align_corners=True)
-            rec_map = F.interpolate(rec_map, size=(bin, bin), mode='bilinear', align_corners=True)
-            sr_out_bin = query_feat_bin * rec_map
+            sr_out_bin = F.interpolate(sr_out, size=(bin, bin), mode='bilinear', align_corners=True)
             # merge_feat_bin = torch.cat([query_feat_bin, supp_feat_bin, sr_out_bin, cr_feat_bin], 1)
-            merge_feat_bin = torch.cat([sr_out_bin, cr_feat_bin], 1)
+            merge_feat_bin = torch.cat([cr_feat_bin + query_feat_bin, sr_out_bin], 1)
             merge_feat_bin = self.init_merge[idx](merge_feat_bin)
 
             if idx >= 1:
@@ -346,7 +299,7 @@ class Model(nn.Module):
 
     def _optimizer(self, args):
         optimizer = torch.optim.SGD(filter(lambda x: x.requires_grad, self.parameters()),
-                                    lr=args.base_lr,
-                                    momentum=args.momentum,
+                                    lr=args.base_lr, 
+                                    momentum=args.momentum, 
                                     weight_decay=args.weight_decay)
         return optimizer
