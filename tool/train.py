@@ -26,7 +26,7 @@ cv2.setNumThreads(0)
 
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch Semantic Segmentation')
-    parser.add_argument('--config', type=str, default='data/config/pascal/pascal_drnet_split0_resnet50.yaml', help='config file')
+    parser.add_argument('--config', type=str, default='data/config/pascal/pascal_drnetv3_linit3_split0_resnet50.yaml', help='config file')
     parser.add_argument('opts', help='see config/ade20k/ade20k_pspnet50.yaml for all options', default=None, nargs=argparse.REMAINDER)
     args = parser.parse_args()
     assert args.config is not None
@@ -206,7 +206,7 @@ def main_worker(gpu, ngpus_per_node, argss):
             os.remove(latest_filename)
         latest_filename = args.save_path + '/train_epoch_' + str(epoch) + '.pth'
         logger.info('Saving checkpoint to: ' + latest_filename)
-        torch.save({'epoch': args.epochs, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict()}, latest_filename)                
+        torch.save({'epoch': epoch, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict()}, latest_filename)                
 
 
 def train(train_loader, model, optimizer, epoch):
@@ -239,7 +239,7 @@ def train(train_loader, model, optimizer, epoch):
         input = input.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
         
-        output, main_loss, aux_loss = model(s_x=s_input, s_y=s_mask, x=input, y=target)
+        output, main_loss, aux_loss = model(s_x=s_input, s_y=s_mask, x=input, y=target, cat_idx=subcls)
 
         if not args.multiprocessing_distributed:
             main_loss, aux_loss = torch.mean(main_loss), torch.mean(aux_loss)
@@ -360,7 +360,7 @@ def validate(val_loader, model, criterion):
             ori_label = ori_label.cuda(non_blocking=True)
 
             start_time = time.time()
-            output = model(s_x=s_input, s_y=s_mask, x=input, y=target)
+            output = model(s_x=s_input, s_y=s_mask, x=input, y=target, cat_idx=subcls)
             total_time = total_time + 1
             model_time.update(time.time() - start_time)
 

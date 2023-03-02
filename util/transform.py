@@ -122,6 +122,17 @@ class Resize(object):
         return image, label
 
 
+class Resize_ori(object):
+    def __init__(self, size):
+        self.size = size
+
+    def __call__(self, image, label):
+        from torchvision.transforms import Resize
+        image = Resize(self.size, interpolation=3)(image)
+        label = Resize(self.size, interpolation=cv2.INTER_NEAREST)(label)
+
+        return image, label
+
 class test_Resize(object):
     # Resize the input to the given size, 'size' is a 2-element tuple or list in the order of (h, w).
     def __init__(self, size):

@@ -1,4 +1,5 @@
 #!/bin/sh
+# coding: utf-8
 PARTITION=Segmentation
 
 dataset=$1
@@ -12,6 +13,6 @@ config=data/config/${dataset}/${dataset}_${model_name}_${exp_name}.yaml
 
 mkdir -p ${model_dir} ${result_dir}
 now=$(date +"%Y%m%d_%H%M%S")
-cp tool/test.sh tool/test.py ${config} ${exp_dir}
+cp tool/train_ori.sh tool/train_ori.py model/${model_name}.py ${config} ${exp_dir}
 
-CUDA_VISIBLE_DEVICES=${gpu} python -u -m tool.test --config=${config} 2>&1 | tee ${result_dir}/test-$now.log
+CUDA_VISIBLE_DEVICES=${gpu}  python -u -m tool.train --config=${config} 2>&1 | tee ${result_dir}/train-$now.log

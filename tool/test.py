@@ -6,8 +6,8 @@ import numpy as np
 import logging
 import argparse
 
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+# os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+# os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -17,7 +17,8 @@ import torch.nn.parallel
 import torch.optim
 import torch.utils.data
 import torch.multiprocessing as mp
-from tensorboardX import SummaryWriter
+# from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 
 from model import *
 from util import dataset
@@ -30,7 +31,7 @@ cv2.setNumThreads(0)
 
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch Semantic Segmentation')
-    parser.add_argument('--config', type=str, default='config/ade20k/ade20k_pspnet50.yaml', help='config file')
+    parser.add_argument('--config', type=str, default='data/config/pascal/pascal_BAM_split0_resnet50.yaml', help='config file')
     parser.add_argument('opts', help='see config/ade20k/ade20k_pspnet50.yaml for all options', default=None, nargs=argparse.REMAINDER)
     args = parser.parse_args()
     assert args.config is not None
@@ -64,7 +65,7 @@ def main():
     assert args.classes > 1
     assert args.zoom_factor in [1, 2, 4, 8]
     assert (args.train_h - 1) % 8 == 0 and (args.train_w - 1) % 8 == 0
-    os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in args.train_gpu)
+    # os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in args.train_gpu)
     if args.manual_seed is not None:
         cudnn.benchmark = False
         cudnn.deterministic = True
@@ -98,6 +99,19 @@ def main_worker(gpu, ngpus_per_node, argss):
 
     model = eval(args.arch).Model(args)
 
+    learn_param = 0
+    for param in model.parameters():
+        if param.requires_grad:
+            learn_param += param.numel()
+    print('Learnable parameters: {} M'.format(learn_param / 1e6))
+
+    if hasattr(model, 'non_local'):
+        cr_params = sum([param.numel() for param in model.non_local.parameters()]) / 1e6
+        print('Parameters of the CR module: {}'.format(cr_params))
+    if hasattr(model, 'cr'):
+        cr_params = sum([param.numel() for param in model.cr.parameters()]) / 1e6
+        print('Parameters of the CRTrans module: {}'.format(cr_params))
+
     global logger, writer
     logger = get_logger()
     writer = SummaryWriter(args.save_path)
@@ -112,7 +126,10 @@ def main_worker(gpu, ngpus_per_node, argss):
         if os.path.isfile(args.weight):
             logger.info("=> loading weight '{}'".format(args.weight))
             checkpoint = torch.load(args.weight)
-            model.load_state_dict(checkpoint['state_dict'])
+            try:
+                model.load_state_dict(checkpoint['state_dict'])
+            except:
+                model.module.load_state_dict(checkpoint['state_dict'])
             logger.info("=> loaded weight '{}'".format(args.weight))
         else:
             logger.info("=> no weight found at '{}'".format(args.weight))
@@ -136,12 +153,14 @@ def main_worker(gpu, ngpus_per_node, argss):
             transform.test_Resize(size=args.val_size),
             transform.ToTensor(),
             transform.Normalize(mean=mean, std=std)])
-    val_data = dataset.SemData(split=args.split, shot=args.shot, max_sp=args.max_sp, data_root=args.data_root,
+    val_data = dataset.SemData(split=args.split, shot=args.shot, data_root=args.data_root,
                                data_list=args.val_list, transform=val_transform, mode='val',
                                use_coco=args.use_coco, use_split_coco=args.use_split_coco)
     val_loader = torch.utils.data.DataLoader(val_data, batch_size=args.batch_size_val, shuffle=False,
                                              num_workers=args.workers, pin_memory=True, sampler=None)
-    loss_val, mIoU_val, mAcc_val, allAcc_val, class_miou = validate(val_loader, model, criterion, args)
+    
+    with torch.no_grad():
+        loss_val, mIoU_val, mAcc_val, allAcc_val, class_miou = validate(val_loader, model, criterion, args)
 
 def validate(val_loader, model, criterion, args):
     if main_process():
@@ -180,7 +199,7 @@ def validate(val_loader, model, criterion, args):
     iter_num = 0
     total_time = 0
     for e in range(20):
-        for i, (input, target, s_input, s_mask, s_init_seed, subcls, ori_label) in enumerate(val_loader):
+        for i, (input, target, s_input, s_mask, subcls, ori_label) in enumerate(val_loader):
             if (iter_num-1) * args.batch_size_val >= test_num:
                 break
             iter_num += 1
@@ -188,8 +207,9 @@ def validate(val_loader, model, criterion, args):
             input = input.cuda(non_blocking=True)
             target = target.cuda(non_blocking=True)
             ori_label = ori_label.cuda(non_blocking=True)
+            cat_idx = subcls[0].cuda(non_blocking=True)
             start_time = time.time()
-            output = model(s_x=s_input, s_y=s_mask, x=input, y=target, s_seed=s_init_seed)
+            output, init_map, sr_out = model(s_x=s_input, s_y=s_mask, x=input, y=target, cat_idx=cat_idx)
             total_time = total_time + 1
             model_time.update(time.time() - start_time)
 
@@ -200,7 +220,14 @@ def validate(val_loader, model, criterion, args):
                 target = backmask.clone().long()
 
             output = F.interpolate(output, size=target.size()[1:], mode='bilinear', align_corners=True)
+            init_map = F.interpolate(init_map, size=target.size()[1:], mode='bilinear', align_corners=True)
+            sr_out = F.interpolate(sr_out, size=target.size()[1:], mode='bilinear', align_corners=True)
             loss = criterion(output, target)
+            if args.save_fig:
+                visualization(s_x=s_input, s_y=s_mask, x=input, y=target, 
+                              pred=output, init_map=init_map, sr_out=sr_out,
+                              sub_cls=subcls[0].cpu().numpy()[0],
+                              split_gap=split_gap, iter=i, amaps=None)
 
             n = input.size(0)
             loss = torch.mean(loss)
@@ -257,6 +284,152 @@ def validate(val_loader, model, criterion, args):
 
     print('avg inference time: {:.4f}, count: {}'.format(model_time.avg, test_num))
     return loss_meter.avg, mIoU, mAcc, allAcc, class_miou
+
+
+label_colours = [(128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128), (128, 0, 128)
+                 # 1=aeroplane, 2=bicycle, 3=bird, 4=boat, 5=bottle
+    , (0, 128, 128), (128, 128, 128), (64, 0, 0), (192, 0, 0), (64, 128, 0)
+                 # 6=bus, 7=car, 8=cat, 9=chair, 10=cow
+    , (192, 128, 0), (64, 0, 128), (192, 0, 128), (64, 128, 128), (192, 128, 128)
+                 # 11=diningtable, 12=dog, 13=horse, 14=motorbike, 15=person
+    , (0, 64, 0), (128, 64, 0), (0, 192, 0), (128, 192, 0), (0, 64, 128)]
+
+
+def get_ori_img(img):
+    mean = [0.485, 0.456, 0.406]
+    mean = [item * 255 for item in mean]
+    std = [0.229, 0.224, 0.225]
+    std = [item * 255 for item in std]
+
+    return img * std + mean
+
+
+def to_numpy(img, label):
+    if isinstance(img, torch.Tensor):
+        img = img.detach().cpu().numpy()
+    img = np.transpose(img, (1, 2, 0))
+
+    if isinstance(label, torch.Tensor):
+        label = label.detach().cpu().numpy()
+
+    return img, label
+
+
+def fuse_img_label(img, label, cls):
+    label = label.copy()
+    label[label == 255] = 0
+    label = np.expand_dims(label, -1)
+    label = label.repeat(3, -1) * label_colours[cls]
+
+    if img.shape != label.shape:
+        img = cv2.resize(img, label.shape[:2])
+
+    out = cv2.addWeighted(img.astype('uint8'), 1, label.astype('uint8'), 0.8, 0)
+    out = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+    return out
+
+
+def get_heatmap(img, target):
+    if isinstance(img, torch.Tensor):
+        img = img.detach().cpu().numpy().squeeze()
+    target = target.squeeze()
+
+    img = (img - img.min()) / (img.max() - img.min()) * 255
+    img[target == 255] = 0
+    img = img.astype('uint8')
+    heatmap = cv2.applyColorMap(img, cv2.COLORMAP_JET)
+
+    return heatmap
+
+
+def visualization(s_x, s_y, x, y, pred, init_map, sr_out, sub_cls, split_gap, iter, amaps=None):
+    cls = (sub_cls - 1) % split_gap
+    save_path = args.save_path
+    save_path = save_path.replace('model', 'visual')
+    save_path = f'{save_path}/{cls}'
+
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+
+    s_x, s_y = to_numpy(s_x[0][0], s_y[0][0])
+    x, y = to_numpy(x[0], y[0])
+
+    # 生成预测结果的 heatmap
+    pred_t = torch.softmax(pred, dim=1)
+    heatmap = pred_t[0, 1, :, :]
+    heatmap[y == 255] = 0
+    # plt.figure()
+    # sns.heatmap(heatmap, cbar=False)
+    # plt.xticks([])
+    # plt.yticks([])
+    # plt.savefig(f'{save_path}/{iter}_heatmap.png')
+    # plt.close()
+    heatmap = get_heatmap(heatmap, y)
+    cv2.imwrite(f'{save_path}/{iter}_heatmap.png', heatmap)
+
+    pred = pred.argmax(dim=1)
+    pred = pred[0].detach().cpu().numpy()
+
+    init_map = init_map.argmax(dim=1)
+    init_map = init_map[0].detach().cpu().numpy()
+
+    sr_out = sr_out.squeeze(1)[0].detach().cpu().numpy()
+    sr_out = np.where(sr_out > 0.7, 1, 0)
+
+    s_x = get_ori_img(s_x)
+    x = get_ori_img(x)
+
+    sup = fuse_img_label(s_x, s_y, sub_cls)
+    que = fuse_img_label(x, y, sub_cls)
+    pre = fuse_img_label(x, pred, sub_cls)
+    init = fuse_img_label(x, init_map, sub_cls)
+    sr = fuse_img_label(x, sr_out, sub_cls)
+
+    cv2.imwrite(f'{save_path}/{iter}_sup.png', sup)
+    cv2.imwrite(f'{save_path}/{iter}_que.png', que)
+    cv2.imwrite(f'{save_path}/{iter}_pre.png', pre)
+    cv2.imwrite(f'{save_path}/{iter}_init.png', init)
+    cv2.imwrite(f'{save_path}/{iter}_sr.png', sr)
+
+    if amaps:
+        H, W = 1, 16
+        h, w = pred.shape
+        heatmaps = np.ones((H * (h + 5) - 5, W * (h + 5) - 5, 3), dtype=np.uint8) * 255
+        # heatmaps = np.ones((h, w * 4 + 15, 3), dtype=np.uint8) * 255
+        x = cv2.resize(x, (w, h)).astype(np.uint8)
+        x = cv2.cvtColor(x, cv2.COLOR_RGB2BGR)
+        for idx, amap in enumerate(amaps):
+            row = idx // W
+            col = idx % W
+            amap = F.interpolate(amap, (h, w), mode='bilinear', align_corners=True)
+            heatmap = get_heatmap(amap, y)
+            # heatmap = heatmap * np.uint8(y == 1)[..., np.newaxis]
+            # heatmap = cv2.addWeighted(x, 1, heatmap, 0.5, 0)
+            heatmaps[row * (h + 5):row * (h + 5) + h, col * (w + 5):col * (w + 5) + w, :] = heatmap
+            # heatmaps[:, idx * (w + 5):idx * (w + 5) + w, :] = heatmap
+        split = np.ones((h, 5, 3), dtype=np.uint8) * 255
+        heatmaps = np.hstack([que, split, heatmaps])
+        # cv2.imwrite(f'{save_path}/{iter}_hmap_bg.png', heatmaps)
+        cv2.imwrite(f'{save_path}/{iter}_hmap_{H * W}.png', heatmaps)
+        # cv2.imwrite(f'heatmaps/hc_heatmaps_0/{iter}_heatmap4.png', heatmaps)
+
+    sup = s_x.astype('uint8')
+    sup = cv2.cvtColor(sup, cv2.COLOR_RGB2BGR)
+    s_y[s_y == 255] = 0
+    s_y = np.uint8(s_y * 255)
+    cv2.imwrite(f'{save_path}/{iter}_sup_raw.png', sup)
+    cv2.imwrite(f'{save_path}/{iter}_sup_mask.png', s_y)
+
+    que = x.astype('uint8')
+    que = cv2.cvtColor(que, cv2.COLOR_RGB2BGR)
+    y[y == 255] = 0;
+    y = np.uint8(y * 255)
+    cv2.imwrite(f'{save_path}/{iter}_que_raw.png', que)
+    cv2.imwrite(f'{save_path}/{iter}_que_mask.png', y)
+
+    pred[pred == 255] = 0
+    pred = np.uint8(pred * 255)
+    cv2.imwrite(f'{save_path}/{iter}_pre_bin.png', pred)
 
 
 if __name__ == '__main__':
